@@ -18,8 +18,6 @@ select
 from raw_input
 ;
 
-/*
-
 -- Create explicit edges to help with our pathfinding endeavors.
 -- State space is ROWS x COLUMNS x DIRECTIONS (we came from)
 create table edges as (
@@ -173,8 +171,9 @@ with recursive
                     edges.dst = visited_nodes.state
                     and visited_nodes.cost <= progress.total_heat + edges.heat_level
             where
+                -- Cannot reach the end with better cost, terminate
                 progress.best_final_cost is null
-                or progress.total_heat + edges.heat_level < progress.best_final_cost  -- Cannot reach the end with better cost, terminate
+                or progress.total_heat + edges.heat_level < progress.best_final_cost
             order by
                 edges.dst,
                 progress.total_heat + edges.heat_level
@@ -186,7 +185,6 @@ where
     state.row = final_row
     and state.col = final_col
 ;
-*/
 
 -- Part two
 
