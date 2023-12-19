@@ -5,24 +5,20 @@ select
 from read_csv('input.txt', sep=chr(28), columns={'line': 'text'})
 ;
 
--- :'(
 .timer on 
 
 create type direction as enum ('up', 'right', 'left', 'down');
 
-create table grid as 
-select
-    row,
-    unnest(generate_series(1, len(line))) - 1 as col,
-    unnest(string_to_array(line, ''))::int as heat_level
-from raw_input
-;
-
 -- Create explicit edges to help with our pathfinding endeavors.
 -- State space is ROWS x COLUMNS x DIRECTIONS (we came from)
-create table edges as (
-with
-    edges_right as (
+with recursive
+    grid as materialized (
+        select
+            row,
+            unnest(generate_series(1, len(line))) - 1 as col,
+            unnest(string_to_array(line, ''))::int as heat_level
+        from raw_input
+    ), edges_right as (
         select
             {
                 'row': src.row,
@@ -98,99 +94,89 @@ with
                 src.col = dst.col
                 and src.row < dst.row
                 and dst.row <= src.row + 3
-    )    
-select * from edges_right
-union all
-select * from edges_left
-union all
-select * from edges_up
-union all
-select * from edges_down
-)
-;
-
-with recursive
-    path_finding_progress as (
+    ), edges as materialized (    
+        select * from edges_right
+        union all
+        select * from edges_left
+        union all
+        select * from edges_up
+        union all
+        select * from edges_down
+    ), path_finding_progress as (
         select
             {
                 'row': 0,
                 'col': 0,
                 'direction': unnest(['down', 'right']::direction[]),
             } as state,
-            0 as total_heat,
-            [
-                { 
-                    'state': 
-                        {
-                            'row': 0,
-                            'col': 0,
-                            'direction': unnest(['down', 'right']::direction[]),
-                        },
-                    'cost': 0
-                }
-            ] as visited_list, -- Recursive queries can't refer to the whole history of computation, so we have to carry the visited list with us
+            0 as best_cost,
+            true as is_active,
             max(row) as final_row,
             max(col) as final_col,
-            null as best_final_cost
-        from grid  -- To get to final row/col
+            null as best_target_cost
+        from grid
         union all
         (
             with
-                visited_nodes_with_duplicates as (
+                new_best_costs as materialized (
+                    select distinct on (edges.dst)
+                        edges.dst as state,
+                        progress.best_cost + edges.heat_level as best_cost,
+                        coalesce(progress.best_cost + edges.heat_level < progress.best_target_cost, true) as is_active,
+                        progress.final_row,
+                        progress.final_col
+                    from
+                        path_finding_progress progress
+                        join edges on
+                            progress.state = edges.src
+                    where progress.is_active
+                    order by
+                        edges.dst,
+                        progress.best_cost + edges.heat_level
+                ), added_best_costs as (
+                    select *
+                    from
+                        new_best_costs new
+                        anti join path_finding_progress progress on
+                            new.state = progress.state
+                ), improved_best_costs as (
                     select
-                        unnest(visited_list).state as state,
-                        unnest(visited_list).cost as cost
-                    from path_finding_progress
-                ), visited_nodes as (
-                    select
-                        state,
-                        min(cost) as cost
-                    from visited_nodes_with_duplicates
-                    group by state
+                        progress.state,
+                        least(progress.best_cost, new.best_cost) as best_cost,
+                        new.best_cost is not null and new.best_cost < progress.best_cost as is_active,
+                        progress.final_row,
+                        progress.final_col
+                    from
+                        path_finding_progress progress
+                        left join new_best_costs new on
+                            progress.state = new.state
+                ), all_costs as (
+                    select *
+                    from added_best_costs
+                    union all
+                    select *
+                    from improved_best_costs
                 )
-            select distinct on (edges.dst)
-                edges.dst as state,
-                progress.total_heat + edges.heat_level as total_heat,
-                array_append(progress.visited_list, {'state': edges.dst, 'cost': progress.total_heat + edges.heat_level}) as visited_list,
-                final_row,
-                final_col,
-                min(  -- Update the best cost for the target node
-                    least(
-                        progress.best_final_cost,
-                        case
-                            when edges.dst.row = final_row and edges.dst.col = final_col then
-                                progress.total_heat + edges.heat_level
-                        end
-                    )
-                ) over () as best_final_cost
-            from
-                path_finding_progress progress
-                join edges on
-                    progress.state = edges.src
-                anti join visited_nodes on  -- We were not there with a better score
-                    edges.dst = visited_nodes.state
-                    and visited_nodes.cost <= progress.total_heat + edges.heat_level
-            where
-                -- Cannot reach the end with better cost, terminate
-                progress.best_final_cost is null
-                or progress.total_heat + edges.heat_level < progress.best_final_cost
-            order by
-                edges.dst,
-                progress.total_heat + edges.heat_level
+            select 
+                *,
+                min(best_cost) filter (where state.row = final_row and state.col = final_col) over () as best_target_cost
+            from all_costs
+            qualify bool_or(is_active) over ()
         )
     )
-select min(total_heat) as part_one
+select min(best_target_cost) as part_one
 from path_finding_progress
-where
-    state.row = final_row
-    and state.col = final_col
 ;
 
--- Part two
 
-create or replace table edges as (
-with
-    edges_right as (
+with recursive
+    grid as materialized (
+        select
+            row,
+            unnest(generate_series(1, len(line))) - 1 as col,
+            unnest(string_to_array(line, ''))::int as heat_level
+        from raw_input
+    ), edges_right as (
         select
             {
                 'row': src.row,
@@ -274,87 +260,74 @@ with
         select * from edges_up
         union all
         select * from edges_down
-    )
-select *
-from all_edges
-where
-    abs(src.row - dst.row) >= 4
-    or abs(src.col - dst.col) >= 4
-)
-;
-
-with recursive
-    path_finding_progress as (
+    ), edges as materialized (
+        select *
+        from all_edges
+        where
+            abs(src.row - dst.row) >= 4
+            or abs(src.col - dst.col) >= 4
+    ), path_finding_progress as (
         select
             {
                 'row': 0,
                 'col': 0,
                 'direction': unnest(['down', 'right']::direction[]),
             } as state,
-            0 as total_heat,
-            [
-                { 
-                    'state': 
-                        {
-                            'row': 0,
-                            'col': 0,
-                            'direction': unnest(['down', 'right']::direction[]),
-                        },
-                    'cost': 0
-                }
-            ] as visited_list, -- Recursive queries can't refer to the whole history of computation, so we have to carry the visited list with us
+            0 as best_cost,
+            true as is_active,
             max(row) as final_row,
             max(col) as final_col,
-            null as best_final_cost
-        from grid  -- To get to final row/col
+            null as best_target_cost
+        from grid
         union all
         (
             with
-                visited_nodes_with_duplicates as (
+                new_best_costs as materialized (
+                    select distinct on (edges.dst)
+                        edges.dst as state,
+                        progress.best_cost + edges.heat_level as best_cost,
+                        coalesce(progress.best_cost + edges.heat_level < progress.best_target_cost, true) as is_active,
+                        progress.final_row,
+                        progress.final_col
+                    from
+                        path_finding_progress progress
+                        join edges on
+                            progress.state = edges.src
+                    where progress.is_active
+                    order by
+                        edges.dst,
+                        progress.best_cost + edges.heat_level
+                ), added_best_costs as (
+                    select *
+                    from
+                        new_best_costs new
+                        anti join path_finding_progress progress on
+                            new.state = progress.state
+                ), improved_best_costs as (
                     select
-                        unnest(visited_list).state as state,
-                        unnest(visited_list).cost as cost
-                    from path_finding_progress
-                ), visited_nodes as (
-                    select
-                        state,
-                        min(cost) as cost
-                    from visited_nodes_with_duplicates
-                    group by state
+                        progress.state,
+                        least(progress.best_cost, new.best_cost) as best_cost,
+                        new.best_cost is not null and new.best_cost < progress.best_cost as is_active,
+                        progress.final_row,
+                        progress.final_col
+                    from
+                        path_finding_progress progress
+                        left join new_best_costs new on
+                            progress.state = new.state
+                ), all_costs as (
+                    select *
+                    from added_best_costs
+                    union all
+                    select *
+                    from improved_best_costs
                 )
-            select distinct on (edges.dst)
-                edges.dst as state,
-                progress.total_heat + edges.heat_level as total_heat,
-                array_append(progress.visited_list, {'state': edges.dst, 'cost': progress.total_heat + edges.heat_level}) as visited_list,
-                final_row,
-                final_col,
-                min(  -- Update the best cost for the target node
-                    least(
-                        progress.best_final_cost,
-                        case
-                            when edges.dst.row = final_row and edges.dst.col = final_col then
-                                progress.total_heat + edges.heat_level
-                        end
-                    )
-                ) over () as best_final_cost
-            from
-                path_finding_progress progress
-                join edges on
-                    progress.state = edges.src
-                anti join visited_nodes on  -- We were not there with a better score
-                    edges.dst = visited_nodes.state
-                    and visited_nodes.cost <= progress.total_heat + edges.heat_level
-            where
-                progress.best_final_cost is null
-                or progress.total_heat + edges.heat_level < progress.best_final_cost  -- Cannot reach the end with better cost, terminate
-            order by
-                edges.dst,
-                progress.total_heat + edges.heat_level
+            select 
+                *,
+                min(best_cost) filter (where state.row = final_row and state.col = final_col) over () as best_target_cost
+            from all_costs
+            qualify bool_or(is_active) over ()
         )
     )
-select min(total_heat) as part_one
+select min(best_target_cost) as part_two
 from path_finding_progress
-where
-    state.row = final_row
-    and state.col = final_col
 ;
